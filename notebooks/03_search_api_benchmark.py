@@ -30,23 +30,51 @@ import httpx
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
-proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
-    cwd=str(ROOT),
-)
-
-# Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
 URL = "http://localhost:8000"
-for _ in range(60):
-    try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
-        if r.status_code == 200 and r.json().get("ready"):
-            break
-    except httpx.HTTPError:
-        pass
-    time.sleep(1)
-else:
-    raise RuntimeError("API didn't become ready within 60s")
+proc = None
+
+# Check if server is already running and ready
+server_ready = False
+try:
+    r = httpx.get(f"{URL}/healthz", timeout=1.0)
+    if r.status_code == 200 and r.json().get("ready"):
+        server_ready = True
+        print("[03] API server is already running and ready on port 8000")
+except Exception:
+    pass
+
+if not server_ready:
+    import sys
+    # Kill any stale/dangling uvicorn server holding port 8000
+    subprocess.run(["pkill", "-9", "-f", "uvicorn app.main:app"], capture_output=True)
+    time.sleep(0.5)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
+    for _ in range(120):
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate()
+            raise RuntimeError(f"uvicorn process exited unexpectedly with code {proc.returncode}:\nSTDOUT: {stdout.decode()}\nSTDERR: {stderr.decode()}")
+        try:
+            r = httpx.get(f"{URL}/healthz", timeout=2.0)
+            if r.status_code == 200 and r.json().get("ready"):
+                server_ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        if proc:
+            proc.terminate()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT: {stdout.decode()}\nSTDERR: {stderr.decode()}")
+        raise RuntimeError("API didn't become ready within 120s")
 
 print(httpx.get(f"{URL}/healthz").json())
 
@@ -127,9 +155,12 @@ else:
 # ## 5. Cleanup — stop the API server
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
-print("API server stopped")
+if proc is not None:
+    proc.terminate()
+    proc.wait(timeout=5)
+    print("API server stopped")
+else:
+    print("API server was external; left running")
 
 # %% [markdown]
 # ## Deliverable evidence
